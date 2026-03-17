@@ -1,13 +1,15 @@
-﻿using Autodesk.AutoCAD.ApplicationServices;
+﻿using System.Globalization;
+using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.EditorInput;
+using Autodesk.AutoCAD.Geometry;
 using Autodesk.AutoCAD.Runtime;
 
 namespace NHXClipBlocks
 {
     public class Commands
     {
-        [CommandMethod("NHXClipBlocks")]
+        [CommandMethod("NHXClipBlocks", CommandFlags.Session)]
         public void NhxClipBlocks()
         {
             Document doc = Application.DocumentManager.MdiActiveDocument;
@@ -36,6 +38,7 @@ namespace NHXClipBlocks
                 return;
 
             string targetLayer;
+            using (var docLock = doc.LockDocument())
             using (Transaction tr = db.TransactionManager.StartTransaction())
             {
                 var pickedPline = (Polyline)tr.GetObject(pickResult.ObjectId, OpenMode.ForRead);
@@ -46,9 +49,10 @@ namespace NHXClipBlocks
             ed.WriteMessage($"\nTarget rectangle layer: {targetLayer}");
 
             // Step 3: Separate the selection into rectangles (on targetLayer) and block references
-            var blockRefs = new List<ObjectId>();
-            var rectangles = new List<ObjectId>();
+            var blockRefIds = new List<ObjectId>();
+            var rectangleIds = new List<ObjectId>();
 
+            using (var docLock = doc.LockDocument())
             using (Transaction tr = db.TransactionManager.StartTransaction())
             {
                 foreach (SelectedObject selObj in selSet)
@@ -59,70 +63,62 @@ namespace NHXClipBlocks
 
                     if (ent is BlockReference)
                     {
-                        blockRefs.Add(selObj.ObjectId);
+                        blockRefIds.Add(selObj.ObjectId);
                     }
                     else if (ent is Polyline pline
                              && pline.Closed
                              && pline.NumberOfVertices == 4
                              && string.Equals(pline.Layer, targetLayer, StringComparison.OrdinalIgnoreCase))
                     {
-                        rectangles.Add(selObj.ObjectId);
+                        rectangleIds.Add(selObj.ObjectId);
                     }
                 }
 
                 tr.Commit();
             }
 
-            if (blockRefs.Count == 0)
+            if (blockRefIds.Count == 0)
             {
                 ed.WriteMessage("\nNo block references found in selection.");
                 return;
             }
 
-            if (rectangles.Count == 0)
+            if (rectangleIds.Count == 0)
             {
                 ed.WriteMessage("\nNo rectangles found on the target layer.");
                 return;
             }
 
-            // Step 4: For each block, count how many rectangles are "on" it
-            //         A rectangle is on a block if its center is inside the block's geometric extents.
+            // Step 4: Match each block to its rectangles, duplicate blocks as needed,
+            //         and collect (blockHandle, rectVertices) pairs for XCLIP.
+            // Each pair = one block ref that needs to be clipped to one rectangle.
+            var clipJobs = new List<(string blockHandle, Point2d[] vertices)>();
+
+            using (var docLock = doc.LockDocument())
             using (Transaction tr = db.TransactionManager.StartTransaction())
             {
-                foreach (ObjectId blkId in blockRefs)
+                var modelSpace = (BlockTableRecord)tr.GetObject(
+                    SymbolUtilityServices.GetBlockModelSpaceId(db), OpenMode.ForWrite);
+
+                foreach (ObjectId blkId in blockRefIds)
                 {
                     var blkRef = (BlockReference)tr.GetObject(blkId, OpenMode.ForRead);
 
                     Extents3d blkExtents;
-                    try
-                    {
-                        blkExtents = blkRef.GeometricExtents;
-                    }
-                    catch
-                    {
-                        // Block has no valid extents, skip
-                        continue;
-                    }
+                    try { blkExtents = blkRef.GeometricExtents; }
+                    catch { continue; }
 
-                    string blockName = blkRef.Name;
-
-                    int count = 0;
-                    foreach (ObjectId rectId in rectangles)
+                    // Find rectangles whose center is inside this block's extents
+                    var matchedRects = new List<ObjectId>();
+                    foreach (ObjectId rectId in rectangleIds)
                     {
                         var rect = (Polyline)tr.GetObject(rectId, OpenMode.ForRead);
 
                         Extents3d rectExtents;
-                        try
-                        {
-                            rectExtents = rect.GeometricExtents;
-                        }
-                        catch
-                        {
-                            continue;
-                        }
+                        try { rectExtents = rect.GeometricExtents; }
+                        catch { continue; }
 
-                        // Use the center of the rectangle to test containment
-                        var center = new Autodesk.AutoCAD.Geometry.Point3d(
+                        var center = new Point3d(
                             (rectExtents.MinPoint.X + rectExtents.MaxPoint.X) / 2.0,
                             (rectExtents.MinPoint.Y + rectExtents.MaxPoint.Y) / 2.0,
                             0);
@@ -130,24 +126,86 @@ namespace NHXClipBlocks
                         if (center.X >= blkExtents.MinPoint.X && center.X <= blkExtents.MaxPoint.X &&
                             center.Y >= blkExtents.MinPoint.Y && center.Y <= blkExtents.MaxPoint.Y)
                         {
-                            count++;
+                            matchedRects.Add(rectId);
                         }
                     }
 
-                    if (count > 0)
+                    if (matchedRects.Count == 0)
                     {
-                        ed.WriteMessage($"\n{blockName} - {count} rectangle{(count == 1 ? "" : "s")}");
+                        ed.WriteMessage($"\n{blkRef.Name} - 0 rectangles (skipped)");
+                        continue;
                     }
-                    else
+
+                    ed.WriteMessage($"\n{blkRef.Name} - {matchedRects.Count} rectangle{(matchedRects.Count == 1 ? "" : "s")}");
+
+                    // First rectangle -> clip the original block ref
+                    var firstVerts = GetRectWcsVertices(tr, matchedRects[0]);
+                    clipJobs.Add((blkRef.Handle.ToString(), firstVerts));
+
+                    // Additional rectangles -> duplicate block ref, clip each copy
+                    for (int i = 1; i < matchedRects.Count; i++)
                     {
-                        ed.WriteMessage($"\n{blockName} - 0 rectangles");
+                        var copy = new BlockReference(blkRef.Position, blkRef.BlockTableRecord)
+                        {
+                            Layer = blkRef.Layer,
+                            ScaleFactors = blkRef.ScaleFactors,
+                            Rotation = blkRef.Rotation,
+                            Normal = blkRef.Normal,
+                        };
+
+                        modelSpace.AppendEntity(copy);
+                        tr.AddNewlyCreatedDBObject(copy, true);
+
+                        var verts = GetRectWcsVertices(tr, matchedRects[i]);
+                        clipJobs.Add((copy.Handle.ToString(), verts));
                     }
                 }
 
                 tr.Commit();
             }
 
-            ed.WriteMessage("\n");
+            // Step 5: Build a script string that runs _XCLIP for each block.
+            // The XCLIP command sequence is:
+            //   _XCLIP <select block> <enter> _New _Polygonal <pt1> <pt2> <pt3> <pt4> <enter>
+            // We select each block by handle using (handent "HANDLE") LISP expression.
+            if (clipJobs.Count > 0)
+            {
+                var script = new System.Text.StringBuilder();
+                foreach (var (handle, verts) in clipJobs)
+                {
+                    // _XCLIP -> select via LISP handent -> enter to end selection
+                    // -> _New -> _Polygonal -> 4 points -> enter to close
+                    script.Append($"(command \"_.XCLIP\" (handent \"{handle}\") \"\" \"_New\" \"_Polygonal\" ");
+                    foreach (var pt in verts)
+                    {
+                        string x = pt.X.ToString("F6", CultureInfo.InvariantCulture);
+                        string y = pt.Y.ToString("F6", CultureInfo.InvariantCulture);
+                        script.Append($"\"{x},{y}\" ");
+                    }
+                    script.Append("\"\")\n");
+                }
+
+                doc.SendStringToExecute(script.ToString(), true, false, false);
+            }
+
+            ed.WriteMessage("\nDone.\n");
+        }
+
+        /// <summary>
+        /// Gets the 4 WCS vertices of a rectangle polyline.
+        /// The _XCLIP command expects points in WCS.
+        /// </summary>
+        private static Point2d[] GetRectWcsVertices(Transaction tr, ObjectId rectId)
+        {
+            var rect = (Polyline)tr.GetObject(rectId, OpenMode.ForRead);
+
+            var pts = new Point2d[rect.NumberOfVertices];
+            for (int i = 0; i < rect.NumberOfVertices; i++)
+            {
+                Point3d wPt = rect.GetPoint3dAt(i);
+                pts[i] = new Point2d(wPt.X, wPt.Y);
+            }
+            return pts;
         }
     }
 }
