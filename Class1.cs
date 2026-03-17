@@ -190,18 +190,21 @@ namespace NHXClipBlocks
                         modelSpace.AppendEntity(rectCopy);
                         tr.AddNewlyCreatedDBObject(rectCopy, true);
 
-                        // Copy the block
-                        var blkCopy = new BlockReference(
-                            new Point3d(blkRef.Position.X + dx, blkRef.Position.Y + dy, blkRef.Position.Z),
-                            blkRef.BlockTableRecord)
-                        {
-                            Layer = blkRef.Layer,
-                            ScaleFactors = blkRef.ScaleFactors,
-                            Rotation = blkRef.Rotation,
-                            Normal = blkRef.Normal,
-                        };
+                        // Clone the block (full deep copy preserves all internal state)
+                        var blkCopy = (BlockReference)blkRef.Clone();
+                        blkCopy.TransformBy(displacement);
                         modelSpace.AppendEntity(blkCopy);
                         tr.AddNewlyCreatedDBObject(blkCopy, true);
+
+                        // Deep-copy attribute references so they appear on the clone
+                        foreach (ObjectId attId in blkRef.AttributeCollection)
+                        {
+                            var attRef = (AttributeReference)tr.GetObject(attId, OpenMode.ForRead);
+                            var attCopy = (AttributeReference)attRef.Clone();
+                            attCopy.TransformBy(displacement);
+                            blkCopy.AttributeCollection.AppendAttribute(attCopy);
+                            tr.AddNewlyCreatedDBObject(attCopy, true);
+                        }
 
                         clipWork.Add((blkCopy.ObjectId, shiftedRectExt));
                     }
