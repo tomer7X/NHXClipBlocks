@@ -1,5 +1,6 @@
 ﻿using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.DatabaseServices;
+using Autodesk.AutoCAD.DatabaseServices.Filters;
 using Autodesk.AutoCAD.EditorInput;
 using Autodesk.AutoCAD.Geometry;
 using Autodesk.AutoCAD.Runtime;
@@ -8,7 +9,6 @@ namespace NHXClipBlocks
 {
     public class Commands
     {
-        private const double Margin = 5.0;
         private const int NetColumns = 10;
 
         [CommandMethod("NHXClipBlocks")]
@@ -40,17 +40,18 @@ namespace NHXClipBlocks
             PromptEntityResult netResult = ed.GetEntity(netOpts);
             if (netResult.Status != PromptStatus.OK) return;
 
-            // ── All work in a single transaction ──
+            // ── Gather data in a read transaction, then copy + clip ──
+            string targetLayer;
+            Extents3d netExtents;
+            var blockData = new List<(ObjectId blkId, double blkX, List<ObjectId> rects)>();
+
             using (Transaction tr = db.TransactionManager.StartTransaction())
             {
-                // Target layer from picked rectangle
                 var pickedPline = (Polyline)tr.GetObject(pickResult.ObjectId, OpenMode.ForRead);
-                string targetLayer = pickedPline.Layer;
+                targetLayer = pickedPline.Layer;
                 ed.WriteMessage($"\nTarget rectangle layer: {targetLayer}");
 
-                // NET block extents
                 var netRef = (BlockReference)tr.GetObject(netResult.ObjectId, OpenMode.ForRead);
-                Extents3d netExtents;
                 try { netExtents = netRef.GeometricExtents; }
                 catch
                 {
@@ -59,7 +60,6 @@ namespace NHXClipBlocks
                     return;
                 }
 
-                // Classify selected objects into blocks and rectangles
                 var blockRefIds = new List<ObjectId>();
                 var rectangleIds = new List<ObjectId>();
 
@@ -90,20 +90,9 @@ namespace NHXClipBlocks
                     return;
                 }
 
-                // NET cell dimensions
-                double netMinX = netExtents.MinPoint.X;
-                double netMaxX = netExtents.MaxPoint.X;
-                double netMaxY = netExtents.MaxPoint.Y;
-                double cellWidth = (netMaxX - netMinX) / NetColumns;
-                double cellHeight = cellWidth / 2.0;
-
-                // Match each block to rectangles whose center falls inside the block's extents
-                var blockData = new List<(ObjectId blkId, double blkX, List<ObjectId> rects)>();
-
                 foreach (ObjectId blkId in blockRefIds)
                 {
                     var blkRef = (BlockReference)tr.GetObject(blkId, OpenMode.ForRead);
-
                     Extents3d blkExtents;
                     try { blkExtents = blkRef.GeometricExtents; }
                     catch { continue; }
@@ -131,28 +120,37 @@ namespace NHXClipBlocks
                     }
                 }
 
-                if (blockData.Count == 0)
-                {
-                    ed.WriteMessage("\nNo blocks matched any rectangles.");
-                    tr.Commit();
-                    return;
-                }
+                tr.Commit();
+            }
 
-                // Sort blocks left-to-right
-                blockData.Sort((a, b) => a.blkX.CompareTo(b.blkX));
+            if (blockData.Count == 0)
+            {
+                ed.WriteMessage("\nNo blocks matched any rectangles.");
+                return;
+            }
 
-                // Place copies into NET cells
+            blockData.Sort((a, b) => a.blkX.CompareTo(b.blkX));
+
+            double netMinX = netExtents.MinPoint.X;
+            double netMaxX = netExtents.MaxPoint.X;
+            double netMaxY = netExtents.MaxPoint.Y;
+            double cellWidth = (netMaxX - netMinX) / NetColumns;
+            double cellHeight = cellWidth / 2.0;
+
+            // ── Copy blocks + rectangles into NET, one block copy per rectangle ──
+            // Store (blockCopyId, rectExtents) pairs for XCLIP later.
+            var clipWork = new List<(ObjectId blkCopyId, Extents3d rectExt)>();
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
                 var modelSpace = (BlockTableRecord)tr.GetObject(
                     SymbolUtilityServices.GetBlockModelSpaceId(db), OpenMode.ForWrite);
-
-                int totalCopies = 0;
 
                 for (int idx = 0; idx < blockData.Count; idx++)
                 {
                     var (blkId, _, rects) = blockData[idx];
                     var blkRef = (BlockReference)tr.GetObject(blkId, OpenMode.ForRead);
 
-                    // Compute bounding box of the whole group (block + all its rectangles)
                     Extents3d groupExtents = blkRef.GeometricExtents;
                     foreach (ObjectId rectId in rects)
                     {
@@ -164,29 +162,35 @@ namespace NHXClipBlocks
                     double groupCenterX = (groupExtents.MinPoint.X + groupExtents.MaxPoint.X) / 2.0;
                     double groupCenterY = (groupExtents.MinPoint.Y + groupExtents.MaxPoint.Y) / 2.0;
 
-                    // Which NET cell does this block go into
                     int col = idx % NetColumns;
                     int row = idx / NetColumns;
                     double cellCenterX = netMinX + col * cellWidth + cellWidth / 2.0;
                     double cellCenterY = netMaxY - row * cellHeight - cellHeight / 2.0;
 
-                    // Displacement: move group center to cell center
                     double dx = cellCenterX - groupCenterX;
                     double dy = cellCenterY - groupCenterY;
+                    var displacement = Matrix3d.Displacement(new Vector3d(dx, dy, 0));
 
-                    // Copy each rectangle (shifted)
+                    // Read each rectangle's extents (shifted) and create one block copy per rect
                     foreach (ObjectId rectId in rects)
                     {
                         var rect = (Polyline)tr.GetObject(rectId, OpenMode.ForRead);
+                        Extents3d origRectExt;
+                        try { origRectExt = rect.GeometricExtents; }
+                        catch { continue; }
+
+                        // Shifted rectangle extents in WCS
+                        var shiftedRectExt = new Extents3d(
+                            new Point3d(origRectExt.MinPoint.X + dx, origRectExt.MinPoint.Y + dy, 0),
+                            new Point3d(origRectExt.MaxPoint.X + dx, origRectExt.MaxPoint.Y + dy, 0));
+
+                        // Copy the rectangle
                         var rectCopy = (Polyline)rect.Clone();
-                        rectCopy.TransformBy(Matrix3d.Displacement(new Vector3d(dx, dy, 0)));
+                        rectCopy.TransformBy(displacement);
                         modelSpace.AppendEntity(rectCopy);
                         tr.AddNewlyCreatedDBObject(rectCopy, true);
-                    }
 
-                    // Copy the block N times (one per rectangle), all shifted
-                    for (int i = 0; i < rects.Count; i++)
-                    {
+                        // Copy the block
                         var blkCopy = new BlockReference(
                             new Point3d(blkRef.Position.X + dx, blkRef.Position.Y + dy, blkRef.Position.Z),
                             blkRef.BlockTableRecord)
@@ -198,13 +202,93 @@ namespace NHXClipBlocks
                         };
                         modelSpace.AppendEntity(blkCopy);
                         tr.AddNewlyCreatedDBObject(blkCopy, true);
-                        totalCopies++;
+
+                        clipWork.Add((blkCopy.ObjectId, shiftedRectExt));
                     }
                 }
 
                 tr.Commit();
-                ed.WriteMessage($"\nDone. Placed {blockData.Count} block group(s) into NET cells ({totalCopies} block copies).\n");
             }
+
+            ed.WriteMessage($"\nPlaced {blockData.Count} group(s), {clipWork.Count} block copies total.");
+
+            // ── Apply XCLIP to each block copy, one transaction per clip ──
+            int clipCount = 0;
+            foreach (var (blkCopyId, rectExt) in clipWork)
+            {
+                using (Transaction tr = db.TransactionManager.StartTransaction())
+                {
+                    try
+                    {
+                        var blkRef = (BlockReference)tr.GetObject(blkCopyId, OpenMode.ForWrite);
+
+                        // Transform WCS boundary corners into block-local coordinates
+                        Matrix3d inv = blkRef.BlockTransform.Inverse();
+
+                        Point3d p1 = new Point3d(rectExt.MinPoint.X, rectExt.MinPoint.Y, 0).TransformBy(inv);
+                        Point3d p2 = new Point3d(rectExt.MaxPoint.X, rectExt.MinPoint.Y, 0).TransformBy(inv);
+                        Point3d p3 = new Point3d(rectExt.MaxPoint.X, rectExt.MaxPoint.Y, 0).TransformBy(inv);
+                        Point3d p4 = new Point3d(rectExt.MinPoint.X, rectExt.MaxPoint.Y, 0).TransformBy(inv);
+
+                        var clipBoundary = new Point2dCollection
+                        {
+                            new Point2d(p1.X, p1.Y),
+                            new Point2d(p2.X, p2.Y),
+                            new Point2d(p3.X, p3.Y),
+                            new Point2d(p4.X, p4.Y),
+                        };
+
+                        var spatialDef = new SpatialFilterDefinition(
+                            clipBoundary,
+                            Vector3d.ZAxis,
+                            0.0,
+                            double.PositiveInfinity,
+                            double.NegativeInfinity,
+                            true);
+
+                        var spatialFilter = new SpatialFilter { Definition = spatialDef };
+
+                        if (blkRef.ExtensionDictionary == ObjectId.Null)
+                            blkRef.CreateExtensionDictionary();
+
+                        var extDict = (DBDictionary)tr.GetObject(blkRef.ExtensionDictionary, OpenMode.ForWrite);
+
+                        DBDictionary filterDict;
+                        if (extDict.Contains("ACAD_FILTER"))
+                        {
+                            filterDict = (DBDictionary)tr.GetObject(extDict.GetAt("ACAD_FILTER"), OpenMode.ForWrite);
+                        }
+                        else
+                        {
+                            filterDict = new DBDictionary();
+                            extDict.SetAt("ACAD_FILTER", filterDict);
+                            tr.AddNewlyCreatedDBObject(filterDict, true);
+                        }
+
+                        if (filterDict.Contains("SPATIAL"))
+                        {
+                            var existing = (SpatialFilter)tr.GetObject(filterDict.GetAt("SPATIAL"), OpenMode.ForWrite);
+                            existing.Definition = spatialDef;
+                            spatialFilter.Dispose();
+                        }
+                        else
+                        {
+                            filterDict.SetAt("SPATIAL", spatialFilter);
+                            tr.AddNewlyCreatedDBObject(spatialFilter, true);
+                        }
+
+                        tr.Commit();
+                        clipCount++;
+                    }
+                    catch (System.Exception ex)
+                    {
+                        tr.Abort();
+                        ed.WriteMessage($"\n  XCLIP failed: {ex.Message}");
+                    }
+                }
+            }
+
+            ed.WriteMessage($"\nDone. Applied {clipCount}/{clipWork.Count} XCLIP(s).\n");
         }
     }
 }
