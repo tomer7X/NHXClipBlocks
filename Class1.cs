@@ -93,8 +93,8 @@ namespace NHXClipBlocks
                 }
             }
 
-            // Remove the copied clipping rectangles
-            RemoveClippingRectanglesFromNET(db, clipWork, ed);
+                // Keep the copied clipping rectangles in place and move them with their blocks
+                // (Do not delete them)
         }
 
         private void RemoveClippingRectanglesFromNET(Database db, List<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt, int cell)> clipWork, Editor ed)
@@ -477,7 +477,7 @@ namespace NHXClipBlocks
                     var dst = entries[destIndex];
 
                     var srcRef = tr.GetObject(src.blkId, OpenMode.ForWrite) as BlockReference;
-                    var srcRect = tr.GetObject(src.rectId, OpenMode.ForRead) as Polyline;
+                    var srcRect = tr.GetObject(src.rectId, OpenMode.ForWrite) as Polyline;
                     var dstRect = tr.GetObject(dst.rectId, OpenMode.ForRead) as Polyline;
                     if (srcRef == null || srcRect == null || dstRect == null)
                     {
@@ -515,15 +515,22 @@ namespace NHXClipBlocks
 
                     var disp = Matrix3d.Displacement(new Vector3d(offsetX, offsetY, 0));
 
+                    // Move block reference and its attributes
                     srcRef.TransformBy(disp);
-
-                    // Move attributes too
                     foreach (ObjectId attId in srcRef.AttributeCollection)
                     {
                         var attRef = tr.GetObject(attId, OpenMode.ForWrite) as AttributeReference;
                         if (attRef != null)
                             attRef.TransformBy(disp);
                     }
+
+                    // Also move the copied clipping rectangle so it stays with the block
+                    try
+                    {
+                        if (srcRect != null && !srcRect.IsErased)
+                            srcRect.TransformBy(disp);
+                    }
+                    catch { }
 
                     // Update the stored extents in clipWork so subsequent moves use the new position
                     for (int ci = 0; ci < clipWork.Count; ci++)
