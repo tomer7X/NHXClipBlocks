@@ -4,6 +4,7 @@ using Autodesk.AutoCAD.DatabaseServices.Filters;
 using Autodesk.AutoCAD.EditorInput;
 using Autodesk.AutoCAD.Geometry;
 using Autodesk.AutoCAD.Runtime;
+using System.Linq;
 
 namespace NHXClipBlocks
 {
@@ -35,6 +36,12 @@ namespace NHXClipBlocks
             PromptEntityResult netResult = ed.GetEntity(netOpts);
             if (netResult.Status != PromptStatus.OK) return;
 
+            // Ask orientation (Vertical default)
+            var orientOpts = new PromptKeywordOptions("\nOrientation [Vertical/Horizontal] <Vertical>: ", "Vertical Horizontal");
+            orientOpts.AllowNone = true;
+            PromptResult orientRes = ed.GetKeywords(orientOpts);
+            bool isHorizontal = orientRes.Status == PromptStatus.OK && orientRes.StringResult == "Horizontal";
+
             // Build work list
             if (!BuildWorkList(db, selSet, pickResult.ObjectId, netResult.ObjectId, ed, out string targetLayer, out Extents3d netExtents, out var blockData))
                 return;
@@ -54,7 +61,7 @@ namespace NHXClipBlocks
             double cellHeight = cellWidth / 2.0;
 
             // list of (blkCopyId, rectCopyId, rectExt, cell)
-            var clipWork = CopyToNet(db, blockData, netMinX, netMaxY, cellWidth, cellHeight);
+            var clipWork = CopyToNet(db, blockData, netMinX, netMaxY, cellWidth, cellHeight, isHorizontal);
             ed.WriteMessage($"\nPlaced {blockData.Count} group(s), {clipWork.Count} block copies total.");
 
             int applied = ApplyXClips(db, clipWork, ed);
@@ -69,7 +76,7 @@ namespace NHXClipBlocks
             
 
             // Collect block references grouped by NET cell so the caller can adjust positions
-            var cells = GetBlocksByCell(db, clipWork);
+            var cells = GetBlocksByCell(db, clipWork, isHorizontal);
             ed.WriteMessage($"\n\nBlocks grouped by cell:");
             for (int i = 0; i < cells.Length; i++)
             {
@@ -82,7 +89,7 @@ namespace NHXClipBlocks
                 // arrange as a list: move each item (index k) to sit below previous (k-1)
                 for (int k = 1; k < numberOfRectanglesInCell; k++)
                 {
-                    AttachRectangles(db, clipWork, i, k, k - 1);
+                    AttachRectangles(db, clipWork, i, k, k - 1, isHorizontal);
                 }
             }
 
@@ -212,7 +219,8 @@ namespace NHXClipBlocks
             double netMinX,
             double netMaxY,
             double cellWidth,
-            double cellHeight)
+            double cellHeight,
+            bool isHorizontal)
         {
             var clipWork = new List<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt, int cell)>();
 
@@ -283,7 +291,24 @@ namespace NHXClipBlocks
                 tr.Commit();
             }
 
-            return clipWork;
+            // Now sort the clipWork within each cell according to orientation so later grouping preserves order
+            var sorted = new List<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt, int cell)>();
+            var groups = clipWork.GroupBy(x => x.cell).OrderBy(g => g.Key);
+            foreach (var g in groups)
+            {
+                IEnumerable<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt, int cell)> ordered;
+                if (isHorizontal)
+                {
+                    ordered = g.OrderBy(x => x.rectExt.MinPoint.X).ThenByDescending(x => x.rectExt.MaxPoint.Y);
+                }
+                else
+                {
+                    ordered = g.OrderByDescending(x => x.rectExt.MaxPoint.Y).ThenBy(x => x.rectExt.MinPoint.X);
+                }
+                sorted.AddRange(ordered);
+            }
+
+            return sorted;
         }
 
         private int ApplyXClips(Database db, List<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt, int cell)> clipWork, Editor ed)
@@ -365,30 +390,67 @@ namespace NHXClipBlocks
             return clipCount;
         }
 
-        private List<ObjectId>[] GetBlocksByCell(Database db, List<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt, int cell)> clipWork)
+        private List<ObjectId>[] GetBlocksByCell(
+    Database db,
+    List<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt, int cell)> clipWork,
+    bool isHorizontal)
         {
-            // determine number of cells (max cell index + 1)
             int maxCell = -1;
             foreach (var item in clipWork)
             {
-                if (item.cell > maxCell) maxCell = item.cell;
+                if (item.cell > maxCell)
+                    maxCell = item.cell;
             }
 
             int cellCount = Math.Max(0, maxCell + 1);
             var result = new List<ObjectId>[cellCount];
-            for (int i = 0; i < cellCount; i++) result[i] = new List<ObjectId>();
+            for (int i = 0; i < cellCount; i++)
+                result[i] = new List<ObjectId>();
 
             foreach (var item in clipWork)
             {
-                int c = item.cell;
-                if (c >= 0 && c < cellCount)
-                    result[c].Add(item.blkCopyId);
+                if (item.cell >= 0 && item.cell < cellCount)
+                    result[item.cell].Add(item.blkCopyId);
+            }
+
+            using (var tr = db.TransactionManager.StartTransaction())
+            {
+                var sortKeys = new Dictionary<ObjectId, double>();
+
+                foreach (var item in clipWork)
+                {
+                    if (!sortKeys.ContainsKey(item.blkCopyId))
+                    {
+                        var br = tr.GetObject(item.blkCopyId, OpenMode.ForRead) as BlockReference;
+                        if (br != null)
+                        {
+                            var ext = br.GeometricExtents;
+                            sortKeys[item.blkCopyId] = isHorizontal
+                                ? ext.MinPoint.X
+                                : ext.MaxPoint.Y;
+                        }
+                    }
+                }
+
+                for (int i = 0; i < cellCount; i++)
+                {
+                    if (isHorizontal)
+                    {
+                        result[i].Sort((a, b) => sortKeys[a].CompareTo(sortKeys[b]));
+                    }
+                    else
+                    {
+                        result[i].Sort((a, b) => sortKeys[b].CompareTo(sortKeys[a]));
+                    }
+                }
+
+                tr.Commit();
             }
 
             return result;
         }
 
-        private void AttachRectangles(Database db, List<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt, int cell)> clipWork, int cellIndex, int sourceIndex, int destIndex)
+        private void AttachRectangles(Database db, List<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt, int cell)> clipWork, int cellIndex, int sourceIndex, int destIndex, bool isHorizontal)
         {
             // Generic: move the rectangle at sourceIndex so it is positioned relative to destIndex
             // destIndex rectangle is assumed to be above the source rectangle. We will move the source
@@ -423,13 +485,35 @@ namespace NHXClipBlocks
                         return;
                     }
 
-                    // Use extents: move so src.MaxY is just below dst.MinY with margin
-                    double srcMaxY = src.rectExt.MaxPoint.Y;
-                    double dstMinY = dst.rectExt.MinPoint.Y;
-                    double margin = 5.0;
+                    // Determine whether rectangles are aligned by X (vertical stack) or by Y (horizontal list)
+                    double srcCenterX = (src.rectExt.MinPoint.X + src.rectExt.MaxPoint.X) / 2.0;
+                    double srcCenterY = (src.rectExt.MinPoint.Y + src.rectExt.MaxPoint.Y) / 2.0;
+                    double dstCenterX = (dst.rectExt.MinPoint.X + dst.rectExt.MaxPoint.X) / 2.0;
+                    double dstCenterY = (dst.rectExt.MinPoint.Y + dst.rectExt.MaxPoint.Y) / 2.0;
 
-                    double offsetY = (dstMinY - margin) - srcMaxY;
-                    var disp = Matrix3d.Displacement(new Vector3d(0, offsetY, 0));
+                    double dx = System.Math.Abs(srcCenterX - dstCenterX);
+                    double dy = System.Math.Abs(srcCenterY - dstCenterY);
+
+                    double margin = 5.0;
+                    double offsetX = 0.0;
+                    double offsetY = 0.0;
+
+                    if (!isHorizontal && dx < dy)
+                    {
+                        // X coordinates are approximately equal -> vertical stacking (move in Y)
+                        double srcMaxY = src.rectExt.MaxPoint.Y;
+                        double dstMinY = dst.rectExt.MinPoint.Y;
+                        offsetY = (dstMinY - margin) - srcMaxY;
+                    }
+                    else
+                    {
+                        // Y coordinates are approximately equal -> horizontal list (move in X)
+                        double srcMinX = src.rectExt.MinPoint.X;
+                        double dstMaxX = dst.rectExt.MaxPoint.X;
+                        offsetX = (dstMaxX + margin) - srcMinX;
+                    }
+
+                    var disp = Matrix3d.Displacement(new Vector3d(offsetX, offsetY, 0));
 
                     srcRef.TransformBy(disp);
 
@@ -448,8 +532,8 @@ namespace NHXClipBlocks
                         if (it.rectCopyId == src.rectId && it.blkCopyId == src.blkId && it.cell == cellIndex)
                         {
                             var newExt = new Extents3d(
-                                new Point3d(it.rectExt.MinPoint.X, it.rectExt.MinPoint.Y + offsetY, 0),
-                                new Point3d(it.rectExt.MaxPoint.X, it.rectExt.MaxPoint.Y + offsetY, 0));
+                                new Point3d(it.rectExt.MinPoint.X + offsetX, it.rectExt.MinPoint.Y + offsetY, 0),
+                                new Point3d(it.rectExt.MaxPoint.X + offsetX, it.rectExt.MaxPoint.Y + offsetY, 0));
                             clipWork[ci] = (it.blkCopyId, it.rectCopyId, newExt, it.cell);
                             break;
                         }
