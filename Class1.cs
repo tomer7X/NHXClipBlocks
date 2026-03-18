@@ -53,32 +53,50 @@ namespace NHXClipBlocks
             double cellWidth = (netMaxX - netMinX) / NetColumns;
             double cellHeight = cellWidth / 2.0;
 
-            //list of ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt
+            // list of (blkCopyId, rectCopyId, rectExt, cell)
             var clipWork = CopyToNet(db, blockData, netMinX, netMaxY, cellWidth, cellHeight);
             ed.WriteMessage($"\nPlaced {blockData.Count} group(s), {clipWork.Count} block copies total.");
 
             int applied = ApplyXClips(db, clipWork, ed);
             ed.WriteMessage($"\nDone. Applied {applied}/{clipWork.Count} XCLIP(s).\n");
 
-            for(int i = 0; i < clipWork.Count; i++)
+            for (int i = 0; i < clipWork.Count; i++)
             {
-                var (blkCopyId, rectCopyId, rectExt) = clipWork[i];
-                ed.WriteMessage($"\n  {i + 1}. Block {blkCopyId}, Rect {rectCopyId}, Extents: ({rectExt.MinPoint.X}, {rectExt.MinPoint.Y}) to ({rectExt.MaxPoint.X}, {rectExt.MaxPoint.Y})");
+                var (blkCopyId, rectCopyId, rectExt, cell) = clipWork[i];
+                ed.WriteMessage($"\n  {i + 1}. Cell {cell}, Block {blkCopyId}, Rect {rectCopyId}, Extents: ({rectExt.MinPoint.X}, {rectExt.MinPoint.Y}) to ({rectExt.MaxPoint.X}, {rectExt.MaxPoint.Y})");
             }
 
-
             
+
+            // Collect block references grouped by NET cell so the caller can adjust positions
+            var cells = GetBlocksByCell(db, clipWork);
+            ed.WriteMessage($"\n\nBlocks grouped by cell:");
+            for (int i = 0; i < cells.Length; i++)
+            {
+                ed.WriteMessage($"\n  Cell {i}: {cells[i].Count} block(s)");
+                foreach (var blkId in cells[i])
+                {
+                    ed.WriteMessage($"\n    Block {blkId}");
+                }
+                int numberOfRectanglesInCell = cells[i].Count;
+                // arrange as a list: move each item (index k) to sit below previous (k-1)
+                for (int k = 1; k < numberOfRectanglesInCell; k++)
+                {
+                    AttachRectangles(db, clipWork, i, k, k - 1);
+                }
+            }
+
             // Remove the copied clipping rectangles
             RemoveClippingRectanglesFromNET(db, clipWork, ed);
         }
 
-        private void RemoveClippingRectanglesFromNET(Database db, List<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt)> clipWork, Editor ed)
+        private void RemoveClippingRectanglesFromNET(Database db, List<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt, int cell)> clipWork, Editor ed)
         {
             using (Transaction tr = db.TransactionManager.StartTransaction())
             {
                 foreach (var item in clipWork)
                 {
-                    // item: (blkCopyId, rectCopyId, rectExt)
+                    // item: (blkCopyId, rectCopyId, rectExt, cell)
                     ObjectId rectId = item.rectCopyId;
                     try
                     {
@@ -188,7 +206,7 @@ namespace NHXClipBlocks
             return true;
         }
 
-        private List<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt)> CopyToNet(
+        private List<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt, int cell)> CopyToNet(
             Database db,
             List<(ObjectId blkId, double blkX, List<ObjectId> rects)> blockData,
             double netMinX,
@@ -196,7 +214,7 @@ namespace NHXClipBlocks
             double cellWidth,
             double cellHeight)
         {
-            var clipWork = new List<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt)>();
+            var clipWork = new List<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt, int cell)>();
 
             using (Transaction tr = db.TransactionManager.StartTransaction())
             {
@@ -257,7 +275,8 @@ namespace NHXClipBlocks
                             tr.AddNewlyCreatedDBObject(attCopy, true);
                         }
 
-                        clipWork.Add((blkCopy.ObjectId, rectCopy.ObjectId, shiftedRectExt));
+                        int cell = idx; // zero-based cell index (row*NetColumns + col)
+                        clipWork.Add((blkCopy.ObjectId, rectCopy.ObjectId, shiftedRectExt, cell));
                     }
                 }
 
@@ -267,10 +286,10 @@ namespace NHXClipBlocks
             return clipWork;
         }
 
-        private int ApplyXClips(Database db, List<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt)> clipWork, Editor ed)
+        private int ApplyXClips(Database db, List<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt, int cell)> clipWork, Editor ed)
         {
             int clipCount = 0;
-            foreach (var (blkCopyId, _, rectExt) in clipWork)
+            foreach (var (blkCopyId, _, rectExt, _) in clipWork)
             {
                 using (Transaction tr = db.TransactionManager.StartTransaction())
                 {
@@ -344,6 +363,105 @@ namespace NHXClipBlocks
             }
 
             return clipCount;
+        }
+
+        private List<ObjectId>[] GetBlocksByCell(Database db, List<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt, int cell)> clipWork)
+        {
+            // determine number of cells (max cell index + 1)
+            int maxCell = -1;
+            foreach (var item in clipWork)
+            {
+                if (item.cell > maxCell) maxCell = item.cell;
+            }
+
+            int cellCount = Math.Max(0, maxCell + 1);
+            var result = new List<ObjectId>[cellCount];
+            for (int i = 0; i < cellCount; i++) result[i] = new List<ObjectId>();
+
+            foreach (var item in clipWork)
+            {
+                int c = item.cell;
+                if (c >= 0 && c < cellCount)
+                    result[c].Add(item.blkCopyId);
+            }
+
+            return result;
+        }
+
+        private void AttachRectangles(Database db, List<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt, int cell)> clipWork, int cellIndex, int sourceIndex, int destIndex)
+        {
+            // Generic: move the rectangle at sourceIndex so it is positioned relative to destIndex
+            // destIndex rectangle is assumed to be above the source rectangle. We will move the source
+            // so its top (maxY) is just below the dest's bottom (minY) with the specified margin (5.0).
+            if (clipWork == null)
+                return;
+
+            // collect entries for the requested cell preserving clipWork order
+            var entries = new List<(ObjectId blkId, ObjectId rectId, Extents3d rectExt)>();
+            foreach (var item in clipWork)
+            {
+                if (item.cell == cellIndex)
+                    entries.Add((item.blkCopyId, item.rectCopyId, item.rectExt));
+            }
+
+            if (sourceIndex < 0 || destIndex < 0 || sourceIndex >= entries.Count || destIndex >= entries.Count)
+                return;
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                try
+                {
+                    var src = entries[sourceIndex];
+                    var dst = entries[destIndex];
+
+                    var srcRef = tr.GetObject(src.blkId, OpenMode.ForWrite) as BlockReference;
+                    var srcRect = tr.GetObject(src.rectId, OpenMode.ForRead) as Polyline;
+                    var dstRect = tr.GetObject(dst.rectId, OpenMode.ForRead) as Polyline;
+                    if (srcRef == null || srcRect == null || dstRect == null)
+                    {
+                        tr.Commit();
+                        return;
+                    }
+
+                    // Use extents: move so src.MaxY is just below dst.MinY with margin
+                    double srcMaxY = src.rectExt.MaxPoint.Y;
+                    double dstMinY = dst.rectExt.MinPoint.Y;
+                    double margin = 5.0;
+
+                    double offsetY = (dstMinY - margin) - srcMaxY;
+                    var disp = Matrix3d.Displacement(new Vector3d(0, offsetY, 0));
+
+                    srcRef.TransformBy(disp);
+
+                    // Move attributes too
+                    foreach (ObjectId attId in srcRef.AttributeCollection)
+                    {
+                        var attRef = tr.GetObject(attId, OpenMode.ForWrite) as AttributeReference;
+                        if (attRef != null)
+                            attRef.TransformBy(disp);
+                    }
+
+                    // Update the stored extents in clipWork so subsequent moves use the new position
+                    for (int ci = 0; ci < clipWork.Count; ci++)
+                    {
+                        var it = clipWork[ci];
+                        if (it.rectCopyId == src.rectId && it.blkCopyId == src.blkId && it.cell == cellIndex)
+                        {
+                            var newExt = new Extents3d(
+                                new Point3d(it.rectExt.MinPoint.X, it.rectExt.MinPoint.Y + offsetY, 0),
+                                new Point3d(it.rectExt.MaxPoint.X, it.rectExt.MaxPoint.Y + offsetY, 0));
+                            clipWork[ci] = (it.blkCopyId, it.rectCopyId, newExt, it.cell);
+                            break;
+                        }
+                    }
+
+                    tr.Commit();
+                }
+                catch
+                {
+                    tr.Abort();
+                }
+            }
         }
     }
 }
