@@ -77,43 +77,13 @@ namespace NHXClipBlocks
 
             // Collect block references grouped by NET cell so the caller can adjust positions
             var cells = GetBlocksByCell(db, clipWork, isHorizontal);
-            ed.WriteMessage($"\n\nBlocks grouped by cell:");
             for (int i = 0; i < cells.Length; i++)
             {
-                ed.WriteMessage($"\n  Cell {i}: {cells[i].Count} block(s)");
-                foreach (var blkId in cells[i])
-                {
-                    ed.WriteMessage($"\n    Block {blkId}");
-                }
-                int numberOfRectanglesInCell = cells[i].Count;
                 // arrange as a list: move each item (index k) to sit below previous (k-1)
-                for (int k = 1; k < numberOfRectanglesInCell; k++)
+                for (int k = 1; k < cells[i].Count; k++)
                 {
                     AttachRectangles(db, clipWork, i, k, k - 1, isHorizontal);
                 }
-            }
-
-                // Keep the copied clipping rectangles in place and move them with their blocks
-                // (Do not delete them)
-        }
-
-        private void RemoveClippingRectanglesFromNET(Database db, List<(ObjectId blkCopyId, ObjectId rectCopyId, Extents3d rectExt, int cell)> clipWork, Editor ed)
-        {
-            using (Transaction tr = db.TransactionManager.StartTransaction())
-            {
-                foreach (var item in clipWork)
-                {
-                    // item: (blkCopyId, rectCopyId, rectExt, cell)
-                    ObjectId rectId = item.rectCopyId;
-                    try
-                    {
-                        var ent = tr.GetObject(rectId, OpenMode.ForWrite) as Entity;
-                        if (ent != null && !ent.IsErased)
-                            ent.Erase();
-                    }
-                    catch { }
-                }
-                tr.Commit();
             }
         }
 
